@@ -1,0 +1,17 @@
+# Web Framework
+Django>=4.2.0
+
+# Celery and Dependencies
+celery>=5.3.1
+redis>=5.0.0
+gevent>=23.9.1
+eventlet>=0.33.3
+
+# ATProto Client
+atproto>=0.0.20
+
+# Async Support
+asgiref>=3.7.2
+
+# Environment Variables
+python-dotenv>=1.0.0 

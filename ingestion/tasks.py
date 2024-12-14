@@ -1,97 +1,87 @@
+from celery import shared_task
 import asyncio
 import logging
-from celery import shared_task
-from celery.exceptions import MaxRetriesExceededError
-from atproto import FirehoseSubscribeReposClient, parse_subscribe_repos_message
+from atproto import AsyncFirehoseSubscribeReposClient, parse_subscribe_repos_message, models, CAR
 from django.utils import timezone
-from ingestion.models import Event
-from tenacity import retry, stop_after_attempt, wait_exponential
+from datetime import timedelta
+from .models import Event
 
-# Set up logging
 logger = logging.getLogger(__name__)
 
-@shared_task(bind=True, max_retries=3)
+@shared_task(
+    bind=True,
+    name='ingestion.tasks.start_firehose_ingestion',
+    max_retries=None,
+    time_limit=None,
+    soft_time_limit=None,
+    acks_late=True,
+)
 def start_firehose_ingestion(self):
-    """
-    Start ingesting data from the ATProto firehose.
-    Includes retry logic and error handling.
-    """
+    """Start the Bluesky firehose ingestion process."""
     try:
-        client = FirehoseSubscribeReposClient()
-        
-        @retry(
-            stop=stop_after_attempt(3),
-            wait=wait_exponential(multiplier=1, min=4, max=10),
-            reraise=True
-        )
-        def process_message(message):
+        async def message_callback(message):
             try:
                 commit = parse_subscribe_repos_message(message)
                 
-                # Extract repository information
-                repo_name = getattr(commit, 'repo', 'unknown')
-                
-                # Process operations
-                if not hasattr(commit, 'ops') or not commit.ops:
-                    logger.warning(f"No operations found in commit for repo: {repo_name}")
-                    return
+                # Process only commit messages with blocks
+                if isinstance(commit, models.ComAtprotoSyncSubscribeRepos.Commit) and commit.blocks:
+                    car = CAR.from_bytes(commit.blocks)
+                    
+                    # Only process 'create' operations that are posts
+                    for op in commit.ops:
+                        if (op.action == 'create' and 
+                            hasattr(op, 'record') and 
+                            getattr(op.record, '$type', None) == 'app.bsky.feed.post'):
+                            
+                            # Store the event
+                            Event.objects.create(
+                                repo=commit.repo,
+                                operation='create',
+                                record=op.record,
+                                created_at=timezone.now()
+                            )
+                            logger.info(f"Stored new post from {commit.repo}")
 
-                for op in commit.ops:
-                    # Extract operation details
-                    action = getattr(op, 'action', 'unknown')
-                    record_data = {}
-                    
-                    # Process the record based on operation type
-                    if hasattr(op, 'record'):
-                        record_data = {
-                            'type': getattr(op.record, '$type', None),
-                            'text': getattr(op.record, 'text', None),
-                            'created_at': getattr(op.record, 'createdAt', None),
-                            'reply_parent': getattr(op.record, 'reply', {}).get('parent', None),
-                            'reply_root': getattr(op.record, 'reply', {}).get('root', None),
-                            'embed': getattr(op.record, 'embed', None),
-                            'langs': getattr(op.record, 'langs', []),
-                            'labels': getattr(op.record, 'labels', []),
-                        }
-                    
-                    # Create event record
-                    Event.objects.create(
-                        repo=repo_name,
-                        action=action,
-                        record=record_data,
-                        created_at=timezone.now()
-                    )
-                    
-                    logger.info(f"Processed {action} event for repo: {repo_name}")
-                
             except Exception as e:
-                logger.error(f"Error processing message: {str(e)}", exc_info=True)
-                raise  # Re-raise for retry mechanism
+                logger.error(f"Error processing message: {e}", exc_info=True)
 
-        def on_message_handler(message):
+        async def error_callback(error):
+            logger.error(f"Firehose error: {error}", exc_info=True)
+                
+        async def run_client():
+            client = None
             try:
-                process_message(message)
+                logger.info("Starting Firehose client...")
+                client = AsyncFirehoseSubscribeReposClient()
+                await client.start(message_callback, error_callback)
             except Exception as e:
-                logger.error(f"Failed to process message after retries: {str(e)}", exc_info=True)
-
-        def on_connect():
-            logger.info("Connected to ATProto firehose")
-
-        def on_disconnect():
-            logger.warning("Disconnected from ATProto firehose")
-
-        # Start the client with handlers
-        logger.info("Starting firehose ingestion")
-        client.start(
-            on_message_handler,
-            on_connect=on_connect,
-            on_disconnect=on_disconnect
-        )
-
-    except Exception as exc:
-        logger.error(f"Firehose ingestion failed: {str(exc)}", exc_info=True)
+                logger.error(f"Client connection error: {e}", exc_info=True)
+                if client:
+                    try:
+                        await client.stop()
+                    except Exception as e:
+                        logger.error(f"Error stopping client: {e}", exc_info=True)
+                raise
+        
+        # Run the async function
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
         try:
-            self.retry(countdown=60)  # Retry after 1 minute
-        except MaxRetriesExceededError:
-            logger.error("Max retries exceeded for firehose ingestion")
-            raise 
+            loop.run_until_complete(run_client())
+        finally:
+            loop.close()
+            
+    except Exception as exc:
+        logger.error(f"Task failed: {exc}", exc_info=True)
+        raise self.retry(exc=exc, countdown=60)
+
+    return True
+
+@shared_task
+def cleanup_old_events():
+    """Delete events older than 24 hours"""
+    cutoff = timezone.now() - timedelta(hours=24)
+    deleted_count = Event.objects.filter(created_at__lt=cutoff).delete()[0]
+    if deleted_count > 0:
+        logger.info(f"Cleaned up {deleted_count} old events")
